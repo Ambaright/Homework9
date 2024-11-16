@@ -1,0 +1,549 @@
+---
+title: "Seoul Bike Data Modeling"
+format: html
+editor: visual
+---
+
+## Data
+
+We will use a dataset from the UCI Machine Learning Repository. This data set is about bike sharing rentals and is available at the assignment link. You can learn more about the data here. The data is available at
+https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv
+
+The data description describes the following variables:
+
+  • Date : day/month/year
+  • Rented Bike count - Count of bikes rented at each hour
+  • Hour - Hour of the day
+  • Temperature-Temperature in Celsius
+  • Humidity - %
+  • Windspeed - m/s
+  • Visibility - 10m
+  • Dew point temperature - Celsius
+  • Solar radiation - MJ/m2
+  • Rainfall - mm
+  • Snowfall - cm
+  • Seasons - Winter, Spring, Summer, Autumn
+  • Holiday - Holiday/No holiday
+  • Functional Day - NoFunc(Non Functional Hours), Fun(Functional hours)
+
+## Reading Data
+
+Before we can work with the data, we need to read it in!
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+bike_data <- read_csv("https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv",
+                      local = locale(encoding = "latin1"))
+bike_data
+```
+
+We also need to have some necessary data cleaning to have a workable data set for our modeling analysis.
+
+```{r}
+# Make Date a date variable
+bike_data <- bike_data |>
+  mutate(date = lubridate::dmy(Date)) |>
+  select(-Date)
+
+# Make categorical predictors factors
+bike_data <- bike_data |>
+  mutate(seasons = factor(Seasons),
+  holiday = factor(Holiday),
+  fn_day = factor(`Functioning Day`)) |>
+  select(-Seasons, -Holiday, -`Functioning Day`)
+
+# Rename variables for ease of use
+bike_data <- bike_data |>
+  rename('bike_count' = `Rented Bike Count`,
+        'hour' = "Hour",
+        "temp" = `Temperature(°C)`,
+        "wind_speed" = `Wind speed (m/s)`,
+        "humidity" = `Humidity(%)`,
+        "vis" = `Visibility (10m)`,
+        "dew_point_temp" = `Dew point temperature(°C)`,
+        "solar_radiation" = `Solar Radiation (MJ/m2)`,
+        "rainfall" = "Rainfall(mm)",
+        "snowfall" = `Snowfall (cm)`)
+
+# Filter out out of commission days
+bike_data <- bike_data |>
+  filter(fn_day == "Yes") |>
+  select(-fn_day)
+
+bike_data
+```
+
+
+We note that since we are continuing from the last assignment, we can omit the EDA here. However, for more detail on EDA performed reference [Homework 8](https://ambaright.github.io/Homework8/).
+
+## Split the Data
+
+• Use functions from tidymodels to split the data into a training and test set (75/25 split). Use the strata argument to stratify the split on the seasons.
+
+• On the training set, create a 10 fold CV split
+
+```{r}
+set.seed(11)
+bike_split <- initial_split(bike_data, prop = 0.75, strata = seasons)
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+bike_10_fold <- vfold_cv(bike_train, 10)
+```
+
+## Fitting MLR Models
+
+For the 1st recipe:
+
+• Let’s ignore the date variable (so we’ll need to remove that or give it a different ID) but use it to create a weekday/weekend (factor) variable. (See step 2 of the shinymodels tutorial! You can use 9 step_date() then step_mutate() with an factor(if_else(...)) to create the variable. I then had to remove the intermediate variable created.)
+
+• Let’s standardize the numeric variables since their scales are pretty different.
+
+• Let’s create dummy variables for the seasons, holiday, and our new day type variable
+
+```{r}
+MLR_rec1 <- recipe(bike_count ~ ., data = bike_train) |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |>
+  step_rm(date, date_dow) |>
+  step_dummy(seasons, holiday, day_type) |>
+  step_normalize(all_numeric(), -bike_count)
+```
+
+For the 2nd recipe:
+
+• Do the same steps as above.
+
+• Add in interactions between seasons and holiday, seasons and temp, temp and rainfall. For the seasons interactions, you can use starts_with() to create the proper interactions.
+
+```{r}
+MLR_rec2 <- MLR_rec1 |>
+  step_interact(terms = ~starts_with("seasons")*starts_with("holiday") +
+  starts_with("seasons")*temp +
+  temp*rainfall)
+
+```
+
+For the 3rd recipe:
+
+• Do the same as the 2nd recipe.
+
+• Add in quadratic terms for each numeric predictor
+
+```{r}
+MLR_rec3 <- MLR_rec2 |>
+  step_poly(temp,
+          wind_speed,
+          vis,
+          dew_point_temp,
+          solar_radiation,
+          rainfall,
+          snowfall,
+          degree = 2)
+
+```
+
+Now set up linear model fit.
+
+```{r}
+MLR_spec <- linear_reg() |>
+  set_engine("lm")
+
+```
+
+Fit the models using 10 fold CV and consider the training set CV error to choose a best model.
+
+```{r}
+MLR_CV_fit1 <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(MLR_spec) |>
+  fit_resamples(bike_10_fold)
+
+MLR_CV_fit2 <- workflow() |>
+  add_recipe(MLR_rec2) |>
+  add_model(MLR_spec) |>
+  fit_resamples(bike_10_fold)
+
+MLR_CV_fit3 <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(MLR_spec) |>
+  fit_resamples(bike_10_fold)
+```
+
+Get metrics:
+
+```{r}
+rbind(MLR_CV_fit1 |> collect_metrics(),
+      MLR_CV_fit2 |> collect_metrics(),
+      MLR_CV_fit3 |> collect_metrics())
+```
+
+The last MLR model performs the best, and will be the one we fit to the entire training set to see how it predicts to the test set.
+
+```{r}
+MLR_final_wkf <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(MLR_spec)
+```
+
+
+However, before we fit the best MLR model to the entire trianing set we will fit a few other models.
+
+## Fitting a (tuned) LASSO model
+
+We first need to build a LASSO recipe, which we can choose to be similar to our `MLR_rec1`.
+
+```{r}
+LASSO_rec <- recipe(bike_count ~ ., data = bike_train) |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |>
+  step_rm(date, date_dow) |>
+  step_dummy(seasons, holiday, day_type) |>
+  step_normalize(all_numeric(), -bike_count)
+```
+
+Now we need to specify a (tuned) LASSO model.
+
+```{r}
+LASSO_spec <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+```
+
+Now we need our workflow.
+
+```{r}
+LASSO_wkf <- workflow() |>
+  add_recipe(LASSO_rec) |>
+  add_model(LASSO_spec)
+```
+
+Now we need to fit the model with `tune_grid()` and `grid_regular()`.
+
+```{r}
+LASSO_grid <- LASSO_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = grid_regular(penalty(), levels = 200))
+```
+
+We recall that the `LASSO_grid` gives us a tibble with 400 metrics, but we may want these metrics computed across the folds for each of the 200 values of the tuning parameter. 
+
+```{r}
+LASSO_grid |>
+  collect_metrics()
+```
+
+We can then pull out the "best" model with `select_best()` and `finalize_workflow()`.
+
+```{r}
+lowest_rmse_LASSO <- LASSO_grid |>
+  select_best(metric = "rmse")
+lowest_rmse_LASSO
+```
+
+```{r}
+LASSO_wkf |>
+  finalize_workflow(lowest_rmse_LASSO)
+```
+
+We'll hold off fitting this to the entire training set.
+
+## Fitting a (tuned) Regression Tree Model
+
+We first need to create our regression tree recipe. It's important to remember that our tree based models inherently include interactions, so we can again use a similar recipe to `MLR_rec`.
+
+```{r}
+tree_rec <- recipe(bike_count ~ ., data = bike_train) |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |>
+  step_rm(date, date_dow) |>
+  step_dummy(seasons, holiday, day_type) |>
+  step_normalize(all_numeric(), -bike_count)
+```
+
+We now need to specify our model.
+
+```{r}
+# tune tree_depth and cost_complexity
+tree_spec <- decision_tree(tree_depth = tune(),
+                           min_n = 20,
+                           cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+```
+
+Now we can create our workflow.
+
+```{r}
+tree_wkf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(tree_spec)
+```
+
+Now we can use CV to select our tuning parameters.
+
+```{r}
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = c(10,5))
+
+tree_fits <- tree_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = tree_grid)
+```
+
+We can then collect the metric from our fitted regression tree.
+
+```{r}
+tree_fits |>
+  collect_metrics()
+```
+
+Now we can select the best tree model parameters.
+
+```{r}
+tree_best_params <- select_best(tree_fits, metric = "rmse")
+tree_best_params
+```
+
+Now we finalize the workflow.
+
+```{r}
+tree_final_wkf <- tree_wkf |>
+  finalize_workflow(tree_best_params)
+```
+
+We'll wait to refit the entire training data set on these tuning parameters.
+
+## Fitting a (tuned) Bagged Tree Model
+
+We're again going to create our bagged tree recipe, however, we can just use our `MLR_rec1` recipe.
+
+```{r}
+bag_rec <- MLR_rec1
+```
+
+We then need to specify our bagged model with cost_complexity being a tuning parameter.
+
+```{r}
+bag_spec <- bag_tree(tree_depth = 5, min_n = 10, cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+```
+
+We then need to create our workflow.
+
+```{r}
+library(baguette)
+bag_wkf <- workflow() |>
+  add_recipe(bag_rec) |>
+  add_model(bag_spec)
+```
+
+We now need to fit our CV folds.
+
+```{r}
+bag_fit <- bag_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = grid_regular(cost_complexity(),
+                                levels = 15))
+```
+
+We need to collect our metrics.
+
+```{r}
+bag_fit |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+Now we can select the best tuning parameters.
+
+```{r}
+bag_best_params <- select_best(bag_fit, metric = "rmse")
+bag_best_params
+```
+
+And finalize the workflow.
+
+```{r}
+bag_final_wkf <- bag_wkf |>
+  finalize_workflow(bag_best_params)
+```
+
+We'll wait to refit on the entire training set using this tuning parameter.
+
+## Fitting a (tuned) Random Forest Model
+
+Now we want to create a random forest, again with the same `MLR_rec1` recipe.
+
+```{r}
+rf_rec <- MLR_rec1
+```
+
+Now we need to specify our random forest model.
+
+```{r}
+rf_spec <- rand_forest(mtry = tune()) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+```
+
+Now we set up our workflow.
+
+```{r}
+rf_wkf <- workflow() |>
+  add_recipe(rf_rec) |>
+  add_model(rf_spec)
+```
+
+Now we need to fit our CV folds.
+
+```{r}
+rf_fit <- rf_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = 7)
+```
+
+Now we can look at our metrics across the folds.
+
+```{r}
+rf_fit |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+Now we can select our best tuning parameter.
+
+```{r}
+rf_best_params <- select_best(rf_fit, metric = "rmse")
+rf_best_params
+```
+
+Now we can finalize our workflow.
+
+```{r}
+rf_final_wkf <- rf_wkf |>
+  finalize_workflow(rf_best_params)
+```
+
+## Fit Best Models on the Entire Training Set
+
+Each of these models should be fit and tuned on the training set. You should take the best model from each family of models (best LASSO, best Regression tree,. . . ) and fit it to the entire training data set and see how it predicts on the test set. Include your best MLR model from the last homework here.
+
+• Compare all final models on the test set using both rmse and mae (mean absolute error)
+
+We can first start with our best MLR model.
+
+```{r}
+final_MLR_fit <- MLR_final_wkf |>
+  last_fit(bike_split, metrics = metric_set(rmse, mae))
+
+final_MLR_fit |>
+  collect_metrics()
+```
+
+Now the best LASSO model.
+
+```{r}
+LASSO_final <- LASSO_wkf |>
+  finalize_workflow(lowest_rmse_LASSO)
+
+LASSO_final |>
+  last_fit(bike_split, metrics = metric_set(rmse, mae)) |>
+  collect_metrics()
+```
+
+Now the best Regression Tree model.
+
+```{r}
+tree_final_fit <- tree_final_wkf |>
+  last_fit(bike_split, metrics = metric_set(rmse, mae))
+
+tree_final_fit |>
+  collect_metrics()
+```
+
+Now the best Bagged Tree model.
+
+```{r}
+bag_final_fit <- bag_final_wkf |>
+  last_fit(bike_split, metrics = metric_set(rmse, mae))
+
+bag_final_fit |>
+  collect_metrics()
+```
+
+Now the best Random Forest model.
+
+```{r}
+rf_final_fit <- rf_final_wkf |>
+  last_fit(bike_split, metrics = metric_set(rmse, mae))
+
+rf_final_fit |>
+  collect_metrics()
+```
+
+When we compare all five of our best models based on RMSE and MAE, we see that the random forest model performs the best on the test set and is our best model overall. We also see that the LASSO model performs the worst compared to the other models.
+
+## Summaries of the Best Models
+
+In addition to determining the best overall model, we can extract the final model fits for each type and report a summary of the model
+
+– For the LASSO and MLR models, report the final coefficient tables
+
+```{r}
+final_MLR_fit |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+```{r}
+LASSO_final |>
+  fit(bike_train) |>
+  tidy()
+```
+
+
+– For the regression tree model, give a plot of the final fit
+
+```{r}
+tree_final_fit |>
+  extract_fit_engine() |>
+  rpart.plot::rpart.plot(roundint = FALSE)
+```
+
+
+– For the bagged tree and random forest models, produce a variable importance plot
+
+```{r}
+# Bagged tree
+bag_final_model <- extract_fit_engine(bag_final_fit)
+bag_final_model$imp |>
+  mutate(term = factor(term, levels = term)) |>
+  ggplot(aes(x = term, y = value)) +
+  geom_bar(stat = "identity") +
+  coord_flip()
+```
+
+We see that the most important predictor for our bagged model is the temperature predictor.
+
+```{r}
+# Random Forest
+rf_final_model <- extract_fit_engine(rf_final_fit)
+#rf_final_model$imp |>
+#  mutate(term = factor(term, levels = term)) |>
+#  ggplot(aes(x = term, y = value)) +
+#  geom_bar(stat = "identity") +
+#  coord_flip()
+```
+
+## Fit Random Forest Model to the Entire Data Set
+
+```{r}
+rf_full_fit <- rf_final_wkf |>
+  fit(bike_data)
+rf_full_fit
+```
+
